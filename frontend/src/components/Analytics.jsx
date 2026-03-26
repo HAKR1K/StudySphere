@@ -5,7 +5,7 @@ export default function Analytics() {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
-        fetch('http://localhost:5000/api/analytics')
+        fetch('http://localhost:5001/api/analytics')
             .then(res => res.json())
             .then(data => {
                 setApiData(data);
