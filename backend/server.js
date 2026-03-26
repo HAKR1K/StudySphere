@@ -1,27 +1,55 @@
 require('dotenv').config();
 const express = require('express');
-const cors = require('cors');
-const multer = require('multer');
-// ✅ FIX: Do NOT require pdf-parse at the top level — it crashes on startup.
-//    It is required lazily inside the route handler only when a PDF is uploaded.
+const cors    = require('cors');
+const multer  = require('multer');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-const app = express();
-const PORT = process.env.PORT || 5001; // ✅ Fixed: matches frontend (localhost:5001)
+const app  = express();
+const PORT = process.env.PORT || 5001;
 
-
-
+// ─────────────────────────────────────────
 // Middleware
+// ─────────────────────────────────────────
 app.use(cors({
-    origin: '*', // ✅ Allow all origins in dev. In production, set to your frontend URL.
+    origin: '*',
     methods: ['GET', 'POST'],
 }));
-app.use(express.json());
+app.use(express.json({ limit: '20mb' }));
 
 const upload = multer({ storage: multer.memoryStorage() });
 
 // ─────────────────────────────────────────
-// Health Check  (only ONE definition now)
+// Helper: call Groq API
+// ─────────────────────────────────────────
+async function callGroq(messages, maxTokens = 1500, temperature = 0.7) {
+    const apiKey = process.env.GROK_API_KEY;
+    if (!apiKey) throw new Error('GROK_API_KEY is missing from .env');
+
+    const fetch = (await import('node-fetch')).default;
+    const res = await fetch('https://api.groq.com/openai/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+            model: 'llama-3.3-70b-versatile',
+            messages,
+            max_tokens: maxTokens,
+            temperature,
+        }),
+    });
+
+    const data = await res.json();
+    if (!res.ok) {
+        console.error('Groq API error response:', JSON.stringify(data, null, 2));
+        throw new Error(data?.error?.message || `Groq API error ${res.status}`);
+    }
+    return data.choices?.[0]?.message?.content?.trim() || '';
+}
+
+// ─────────────────────────────────────────
+// Health Check
 // ─────────────────────────────────────────
 app.get('/api/health', (req, res) => {
     res.json({
@@ -32,7 +60,67 @@ app.get('/api/health', (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// AI Study Roadmap Generator (Gemini)
+// AI Chat — Groq
+// ─────────────────────────────────────────
+app.post('/api/chat', async (req, res) => {
+    try {
+        const { message, history = [] } = req.body;
+
+        if (!message) {
+            return res.status(400).json({ success: false, message: 'message is required.' });
+        }
+
+        const systemMsg = {
+            role: 'system',
+            content: `You are StudySphere AI Tutor — a brilliant, concise academic assistant.
+Your style:
+- Use **bold** for key terms
+- Use numbered lists for steps, bullet points for lists
+- Use triple backticks for code blocks
+- Keep replies focused and helpful
+- End with a tip or follow-up question when useful`,
+        };
+
+        // Convert history from Gemini format { role, parts } → OpenAI format { role, content }
+        let historyMsgs = history.map(h => ({
+            role: h.role === 'model' ? 'assistant' : 'user',
+            content: Array.isArray(h.parts)
+                ? h.parts.map(p => p.text || '').join('\n')
+                : (h.content || ''),
+        }));
+
+        // FIX 1: Remove messages with empty or whitespace-only content
+        historyMsgs = historyMsgs.filter(m => m.content && m.content.trim().length > 0);
+
+        // FIX 2: Strip leading assistant messages — Groq requires history to start with 'user'
+        while (historyMsgs.length > 0 && historyMsgs[0].role === 'assistant') {
+            historyMsgs.shift();
+        }
+
+        // FIX 3: Merge consecutive same-role messages to prevent role alternation errors
+        const deduped = [];
+        for (const msg of historyMsgs) {
+            if (deduped.length > 0 && deduped[deduped.length - 1].role === msg.role) {
+                deduped[deduped.length - 1].content += '\n' + msg.content;
+            } else {
+                deduped.push({ ...msg });
+            }
+        }
+
+        const messages = [systemMsg, ...deduped, { role: 'user', content: message }];
+
+        const reply = await callGroq(messages, 1500, 0.7);
+        res.json({ success: true, reply });
+
+    } catch (err) {
+        console.error('Chat Error:', err.message);
+        res.status(500).json({ success: false, message: err.message || 'AI Error' });
+    }
+});
+
+// ─────────────────────────────────────────
+// AI Study Roadmap Generator
+// Uses Gemini if GEMINI_API_KEY is set, else Groq, else mock fallback
 // ─────────────────────────────────────────
 app.post('/api/generate-plan', upload.single('document'), async (req, res) => {
     try {
@@ -44,13 +132,10 @@ app.post('/api/generate-plan', upload.single('document'), async (req, res) => {
         // Extract text from uploaded PDF (if any)
         if (file) {
             try {
-                // ✅ Lazy require — only loads pdf-parse when a PDF is actually uploaded
-                const pdfParse = require('pdf-parse');
-                const pdfData = await pdfParse(file.buffer);
+                const pdfParse = require('pdf-parse'); // lazy load
+                const pdfData  = await pdfParse(file.buffer);
                 const extracted = pdfData.text.trim();
-                if (extracted.length > 0) {
-                    contextText = extracted.substring(0, 15000);
-                }
+                if (extracted.length > 0) contextText = extracted.substring(0, 15000);
             } catch (pdfErr) {
                 console.warn('PDF parsing failed, falling back to subject text:', pdfErr.message);
             }
@@ -60,15 +145,7 @@ app.post('/api/generate-plan', upload.single('document'), async (req, res) => {
         const dailyHours = parseInt(hoursPerDay) || 2;
         const totalHours = totalDays * dailyHours;
 
-        // ✅ API key must ONLY come from .env — never hardcode it in source
-        const apiKey = process.env.GEMINI_API_KEY;
-
-        if (apiKey) {
-            // ── Gemini Path ──────────────────────────────────────────────
-            const genAI = new GoogleGenerativeAI(apiKey);
-            const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
-
-            const prompt = `
+        const prompt = `
 You are an expert academic planner.
 Context to study: ${contextText}
 The student has exactly ${totalDays} days to study, committing ${dailyHours} hours per day (Total: ${totalHours} hours).
@@ -83,32 +160,40 @@ Format:
 ]
 `;
 
-            const result      = await model.generateContent(prompt);
-            let responseText  = result.response.text().trim();
+        const geminiKey = process.env.GEMINI_API_KEY;
+        const groqKey   = process.env.GROK_API_KEY;
 
-            // Strip any accidental markdown code-fence wrapping
+        if (geminiKey) {
+            // Gemini Path
+            const genAI = new GoogleGenerativeAI(geminiKey);
+            const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+
+            const result = await model.generateContent(prompt);
+            let responseText = result.response.text().trim();
             responseText = responseText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
 
-            // Extract the JSON array boundaries safely
             const startIndex = responseText.indexOf('[');
             const endIndex   = responseText.lastIndexOf(']');
+            if (startIndex === -1 || endIndex === -1) throw new Error('Gemini did not return a valid JSON array.');
 
-            if (startIndex === -1 || endIndex === -1) {
-                throw new Error('Gemini did not return a valid JSON array.');
-            }
+            const parsedTasks = JSON.parse(responseText.substring(startIndex, endIndex + 1));
+            return res.json({ success: true, tasks: parsedTasks, message: 'AI Roadmap Generated by Gemini!' });
 
-            responseText = responseText.substring(startIndex, endIndex + 1);
-            const parsedTasks = JSON.parse(responseText);
+        } else if (groqKey) {
+            // Groq Fallback
+            let responseText = await callGroq([{ role: 'user', content: prompt }], 2000, 0.3);
+            responseText = responseText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
 
-            return res.json({
-                success: true,
-                tasks: parsedTasks,
-                message: 'AI Roadmap Generated by Gemini!'
-            });
+            const startIndex = responseText.indexOf('[');
+            const endIndex   = responseText.lastIndexOf(']');
+            if (startIndex === -1 || endIndex === -1) throw new Error('Groq did not return a valid JSON array.');
+
+            const parsedTasks = JSON.parse(responseText.substring(startIndex, endIndex + 1));
+            return res.json({ success: true, tasks: parsedTasks, message: 'AI Roadmap Generated by Groq!' });
 
         } else {
-            // ── Mock Fallback (no API key) ────────────────────────────────
-            console.warn('⚠️  No GEMINI_API_KEY in .env — returning mock roadmap.');
+            // Mock Fallback (no API key at all)
+            console.warn('No API key in .env — returning mock roadmap.');
 
             const concepts = [
                 'Fundamentals & Basics',
@@ -126,9 +211,8 @@ Format:
                 const isLast = index === concepts.length - 1;
                 const hours  = isLast ? hoursLeft : hoursPerConcept;
                 hoursLeft   -= hours;
-
                 return {
-                    id:             index + 1, // ✅ ids start at 1, never 0
+                    id:             index + 1,
                     task:           `${concept} — ${subject || 'Uploaded Material'}`,
                     due:            `Day ${Math.ceil((index + 1) * (totalDays / concepts.length))}`,
                     hoursAllocated: hours,
@@ -139,15 +223,14 @@ Format:
             return res.json({
                 success: true,
                 tasks:   fakeTasks,
-                message: 'Mock roadmap returned. Add GEMINI_API_KEY to .env for real AI output.'
+                message: 'Mock roadmap returned. Add GEMINI_API_KEY or GROK_API_KEY to .env for real AI output.'
             });
         }
 
     } catch (err) {
-        console.error('❌ Error generating plan:', err);
+        console.error('Error generating plan:', err);
         res.status(500).json({
             success: false,
-            // ✅ Send the real error so the frontend can display it
             message: err.message || 'Failed to generate AI plan.',
             error:   err.message
         });
@@ -155,28 +238,22 @@ Format:
 });
 
 // ─────────────────────────────────────────
-// Concept Deep-Dive (per card detail)
+// Concept Deep-Dive
+// Uses Gemini if GEMINI_API_KEY is set, else Groq
 // ─────────────────────────────────────────
 app.post('/api/concept-detail', async (req, res) => {
     try {
         const { task, subject, hoursAllocated, due } = req.body;
-
         if (!task) return res.status(400).json({ success: false, message: 'task is required.' });
-
-        const apiKey = process.env.GEMINI_API_KEY;
-        if (!apiKey) return res.status(500).json({ success: false, message: 'No GEMINI_API_KEY set.' });
-
-        const genAI = new GoogleGenerativeAI(apiKey);
-        const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
 
         const prompt = `
 You are an expert teacher and academic content writer.
 Generate a comprehensive deep-dive study guide for the following concept:
 
 Concept: "${task}"
-${subject ? `Subject Area: ${subject}` : ''}
+${subject        ? `Subject Area: ${subject}`                      : ''}
 ${hoursAllocated ? `Study Time Allocated: ${hoursAllocated} hours` : ''}
-${due ? `Scheduled: ${due}` : ''}
+${due            ? `Scheduled: ${due}`                             : ''}
 
 Return ONLY a valid JSON object — no markdown fences, no extra text.
 Use this exact format:
@@ -218,21 +295,34 @@ Use this exact format:
 }
 `;
 
-        const result     = await model.generateContent(prompt);
-        let responseText = result.response.text().trim();
+        const geminiKey = process.env.GEMINI_API_KEY;
+        const groqKey   = process.env.GROK_API_KEY;
+
+        let responseText = '';
+
+        if (geminiKey) {
+            const genAI = new GoogleGenerativeAI(geminiKey);
+            const model = genAI.getGenerativeModel({ model: 'gemini-2.5-flash' });
+            const result = await model.generateContent(prompt);
+            responseText = result.response.text().trim();
+        } else if (groqKey) {
+            responseText = await callGroq([{ role: 'user', content: prompt }], 3000, 0.4);
+        } else {
+            return res.status(500).json({ success: false, message: 'No GEMINI_API_KEY or GROK_API_KEY set in .env' });
+        }
 
         // Strip markdown fences if present
         responseText = responseText.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
 
         const startIndex = responseText.indexOf('{');
         const endIndex   = responseText.lastIndexOf('}');
-        if (startIndex === -1 || endIndex === -1) throw new Error('Gemini did not return valid JSON.');
+        if (startIndex === -1 || endIndex === -1) throw new Error('AI did not return valid JSON.');
 
         const detail = JSON.parse(responseText.substring(startIndex, endIndex + 1));
         return res.json({ success: true, detail });
 
     } catch (err) {
-        console.error('❌ Concept detail error:', err);
+        console.error('Concept detail error:', err);
         res.status(500).json({ success: false, message: err.message || 'Failed to fetch concept detail.' });
     }
 });
@@ -241,7 +331,7 @@ Use this exact format:
 // Learning Hub
 // ─────────────────────────────────────────
 app.get('/api/learning-hub', (req, res) => {
-    console.log('📚 Learning Hub API hit!');
+    console.log('Learning Hub API hit!');
     res.json({
         success: true,
         message: 'Backend API executed successfully! Connected to Node.js.',
@@ -254,10 +344,10 @@ app.get('/api/learning-hub', (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// Study Planner  (initial cache load)
+// Study Planner (initial cache load)
 // ─────────────────────────────────────────
 app.get('/api/study-planner', (req, res) => {
-    console.log('📅 Study Planner API hit!');
+    console.log('Study Planner API hit!');
     res.json({
         success: true,
         message: 'Study Planner data loaded from backend.',
@@ -270,10 +360,10 @@ app.get('/api/study-planner', (req, res) => {
 });
 
 // ─────────────────────────────────────────
-// AI Chat
+// AI Chat status endpoint
 // ─────────────────────────────────────────
 app.get('/api/ai-chat', (req, res) => {
-    console.log('🤖 AI Chat API hit!');
+    console.log('AI Chat API hit!');
     res.json({
         success: true,
         message: 'AI Assistant backend connected and ready.',
@@ -286,7 +376,7 @@ app.get('/api/ai-chat', (req, res) => {
 // Analytics
 // ─────────────────────────────────────────
 app.get('/api/analytics', (req, res) => {
-    console.log('📊 Analytics API hit!');
+    console.log('Analytics API hit!');
     res.json({
         success: true,
         message: 'Analytics data successfully fetched.',
@@ -298,40 +388,9 @@ app.get('/api/analytics', (req, res) => {
     });
 });
 
-// Add this to your existing server.js
-app.post('/api/chat', async (req, res) => {
-    try {
-        const { message } = req.body;
-        const apiKey = process.env.GEMINI_API_KEY;
-
-        if (!apiKey) return res.status(500).json({ success: false, message: "API Key missing" });
-
-        const genAI = new GoogleGenerativeAI(apiKey);
-        // Ensure you use the correct model name
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
-
-        const prompt = `You are the StudySphere AI Tutor. Be concise and helpful. 
-        Student query: ${message}`;
-
-        const result = await model.generateContent(prompt);
-        const response = await result.response;
-        const text = response.text().trim();
-
-        // Send back a clean response
-        res.json({ success: true, reply: text });
-    } catch (err) {
-        console.error("Chat Error:", err);
-        // If Gemini hits a safety filter or quota, it throws here.
-        res.status(500).json({ 
-            success: false, 
-            message: "AI Error: " + err.message 
-        });
-    }
-});
-
 // ─────────────────────────────────────────
 // Start Server
 // ─────────────────────────────────────────
 app.listen(PORT, () => {
-    console.log(`🚀 Server running at http://localhost:${PORT}`);
+    console.log(`Server running at http://localhost:${PORT}`);
 });
