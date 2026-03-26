@@ -5,7 +5,7 @@ export default function LearningHub() {
     const [loading, setLoading] = useState(true);
 
     useEffect(() => {
-        fetch('http://localhost:5000/api/learning-hub')
+        fetch('http://localhost:5001/api/learning-hub')
             .then(res => res.json())
             .then(data => {
                 setApiData(data);

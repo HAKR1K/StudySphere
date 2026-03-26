@@ -5,6 +5,9 @@ import StudyTimer from './components/StudyTimer';
 import Notes from './components/Notes';
 import MySubjects from './components/MySubjects';
 import LearningHub from './components/LearningHub';
+import StudyPlanner from './components/StudyPlanner';
+import AIAssistant from './components/AIAssistant';
+import Analytics from './components/Analytics';
 import './Dashboard.css';
 
 const modules = [
@@ -64,12 +67,44 @@ const modules = [
     }
 ];
 
-export default function Dashboard() {
+export default function Dashboard({ subjects, setSubjects }) {
     const [activeNav, setActiveNav] = useState('dashboard');
+    
+    // ✅ 1. NEW STATE: Track which saved subject is being viewed in the planner
+    const [selectedSubject, setSelectedSubject] = useState(null);
+
+    // ✅ 2. ENHANCED SAVE HANDLER: Ensures tasks have completion states
+    const handleSaveSubject = (newSubject) => {
+        const subjectWithState = {
+            ...newSubject,
+            id: Date.now(), // Unique ID for key tracking
+            tasks: newSubject.tasks.map(t => ({
+                ...t,
+                completed: t.completed || false
+            }))
+        };
+        setSubjects(prev => [...prev, subjectWithState]);
+    };
+
+    // ✅ 3. NEW OPEN HANDLER: Function to switch to planner and load data
+    const handleOpenSavedSubject = (subj) => {
+        setSelectedSubject(subj);
+        setActiveNav('study-planner');
+    };
 
     return (
         <div className="dashboard-layout">
-            <Sidebar active={activeNav} onNav={setActiveNav} />
+
+            {/* ✅ PASS subjects and open handler to sidebar */}
+            <Sidebar
+                active={activeNav}
+                onNav={(navId) => {
+                    setActiveNav(navId);
+                    if (navId !== 'study-planner') setSelectedSubject(null); // Clear selected if moving away
+                }}
+                subjects={subjects}
+                onOpenSubject={handleOpenSavedSubject}
+            />
 
             <div className="dashboard-main">
                 <Header />
@@ -77,7 +112,6 @@ export default function Dashboard() {
                 <main className="dashboard-content">
                     {activeNav === 'dashboard' && (
                         <>
-                            {/* Welcome Banner (Hero area) */}
                             <div className="professional-banner">
                                 <div className="banner-content">
                                     <h2>Welcome back to StudySphere 👋</h2>
@@ -86,13 +120,15 @@ export default function Dashboard() {
                                 <div className="banner-decoration"></div>
                             </div>
 
-                            {/* Main Cards Row */}
                             <div className="premium-cards-grid">
                                 {modules.map(mod => (
                                     <button
                                         key={mod.id}
                                         className={`premium-card ${mod.bgClass}`}
-                                        onClick={() => setActiveNav(mod.id)}
+                                        onClick={() => {
+                                            setActiveNav(mod.id);
+                                            setSelectedSubject(null); // Reset when clicking from main cards
+                                        }}
                                     >
                                         <div className="premium-card-content">
                                             <div className="premium-icon-wrap">
@@ -112,8 +148,23 @@ export default function Dashboard() {
 
                     {activeNav === 'timer' && <StudyTimer />}
                     {activeNav === 'notes' && <Notes />}
-                    {activeNav === 'subjects' && <MySubjects />}
+
+                    {activeNav === 'subjects' && (
+                        <MySubjects subjects={subjects} />
+                    )}
+
                     {activeNav === 'learning-hub' && <LearningHub />}
+
+                    {/* ✅ UPDATED: Pass selectedData to StudyPlanner */}
+                    {activeNav === 'study-planner' && (
+                        <StudyPlanner 
+                            onSaveSubject={handleSaveSubject} 
+                            selectedSubject={selectedSubject} 
+                        />
+                    )}
+
+                    {activeNav === 'ai-chat' && <AIAssistant />}
+                    {activeNav === 'analytics' && <Analytics />}
                 </main>
             </div>
         </div>
